@@ -1,0 +1,15 @@
+# Ignore everything in ros2Packages except the src folder
+ros2Packages/*
+!ros2Packages/src/
+
+# Ignore all __pycache__ directories
+**/__pycache__/
+
+# Ignore wandb
+**/wandb/
+
+# Ignore data folder with datasets
+**/data/
+
+# Ignore trained weights
+**/weights/
