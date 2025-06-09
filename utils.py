@@ -75,9 +75,38 @@ def neuronSweeper(reluMask,config):
     alive = np.where(meanMask > config.dead)[0]
     dead = np.where(meanMask <= config.dead)[0]
     print('Dead neurons', len(dead))
-    return torch.tensor(alive), dead
+    return alive, dead
 
-def pruneCheck(current_dead, previous_dead_list, prunned_list, getRevived=False):
+def deadMatrix(neuronStates):
+    totalNeurons = len(neuronStates[0]['dead']) + len(neuronStates[0]['alive'])
+    #create a one hot encoding list 1 for alive 0 for dead for each epoch
+    matrix = np.zeros((len(neuronStates), totalNeurons), dtype=int)
+    for epoch in range(len(neuronStates)):
+        matrix[epoch, neuronStates[epoch]['alive']] = 1
+        
+    return matrix
+
+def choosePrune(neuronStates, config):
+    
+    #Calcualte one-hot matrix of neuron states
+    matrix = deadMatrix(neuronStates)
+    
+    #calcualte the average 'liveness' of the neurons along epochs
+    liveness = np.mean(matrix, axis=0)
+    
+    toPrune = np.where(liveness <= config.liveness)[0]
+    alive = np.where(liveness > config.liveness)[0]
+    
+    print(np.round(liveness,2))
+    
+    if alive.tolist() != neuronStates[-1]['alive']:
+        print('neurons to be prunned changed!')
+    
+    return alive, toPrune.tolist()
+    
+    
+
+def pruneCheck(neuronStates, getRevived=False):
     """
     Check if current dead neurons are a superset of previously dead neurons.
     Only allow pruning if we're killing the same neurons as before + potentially new ones.
@@ -90,12 +119,20 @@ def pruneCheck(current_dead, previous_dead_list, prunned_list, getRevived=False)
         bool: True if safe to prune, False otherwise
     """
     
+    if len(neuronStates) == 1:
+        return False #avoid prunning on first epoch
+    
+    #TODO temporary fix
     current_dead = neuronStates[-1]['dead']
     previous_dead_list = [neuronStates[i]['dead'] for i in range(len(neuronStates))]
-    prunned_list = [neuronStates[i]['prunned'] for i in range(len(neuronStates))]
     
-    if len(previous_dead_list) == 1 and len(current_dead) != 0:
-        return True  # First pruning is always safe
+    prunned_list = []
+    for i in range(len(neuronStates)):
+        if neuronStates[i]['prunned'] is not None:
+            prunned_list.append(neuronStates[i]['prunned'])
+    
+    # if len(previous_dead_list) == 1 and len(current_dead) != 0:
+    #     return True  # First pruning is always safe
     
     # Get the most recent dead neurons
     last_dead = previous_dead_list[-2]
@@ -116,7 +153,7 @@ def pruneCheck(current_dead, previous_dead_list, prunned_list, getRevived=False)
             return False
     
     # Check if we have new dead neurons (actual progress)
-    current_prunned_set = set(prunned_list[-1])
+    current_prunned_set = set(prunned_list[-1]) if len(prunned_list)!=0 else set([]) #empty set if no prunned neurons
     new_dead_neurons = current_dead_set - last_dead_set
     if len(new_dead_neurons) == 0 and len(current_dead_set - current_prunned_set) == 0 :
         print("No new dead neurons found, skipping pruning")

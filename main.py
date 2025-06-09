@@ -20,7 +20,7 @@ from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, r
 import matplotlib.pyplot as plt
 import numpy as np
 from bitsandbytes.optim import Lion
-from utils import summarize_results, plot_confusion_matrix, neuronSweeper, pruneCheck, plotNeuronActivation
+import utils as ut
 
 # PARAMS
 # torch.set_num_threads(8)
@@ -32,15 +32,17 @@ configD = {
     'lr': 1e-4,
     'ds2use': 0,
     'datasets': ['mnist', 'cifar100'],
-    'num_epochs': 50,
+    'num_epochs': 25,
     'batch': 512,
     'hidSize': 256,
-    'dead':0.5,
+    'dead':0.7, # Threshold for considering a neuron as dead [0;1] 
+    'liveness':0.25, # A neuron has to be alive for >25% of the epochs to not be prunned
     'plateauWindow':5,
     'plateauTH':0.1,
     'gclip':2,
     'device':'cuda',
     'wb': False,
+    'save':False,
     'project_name': 'Legion',
     'basePath': Path(__file__).resolve().parent,  # base dir
     'modelDir': Path(__file__).resolve().parent / 'weights',
@@ -104,8 +106,8 @@ def runModel(model):
         # Print the total number of parameters
         print(f'\nTotal number of parameters: {total_params}')
         # Initialize the epoch neuron state dictionary
-        neuronStates.append({'dead':None,
-                             'alive':None,
+        neuronStates.append({'alive':None,
+                             'dead':None,
                              'prunned':None
                              })
         
@@ -174,6 +176,24 @@ def runModel(model):
         avg_lossV = validLoss / len(valid_dl)
         print(f'\nEpoch {epoch+1}, Validation Loss: {avg_lossV}')
         
+        if avg_loss <= bestTloss and avg_lossV <= bestVloss:
+            bestModel = copy.deepcopy(model)
+            bestTloss = avg_loss
+            bestVloss = avg_lossV
+            if config.save:
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'epoch': epoch,
+                    'losstv': (avg_loss, avg_lossV),
+                    'config': config,
+                }, config.modelDir / 'best.pth')
+                
+            metrics[0] = (conf_mat,acc,prec,recall,f1)
+            
+            # plot_confusion_matrix(all_labels, all_preds, class_names=[str(i) for i in range(10)])
+        
+        
         '''
         Neuron analysis
         '''
@@ -181,10 +201,10 @@ def runModel(model):
         #Concatenate the activation masks of all the batches
         reluMask = np.concatenate(reluMask, axis=0)
         #plot them
-        plotNeuronActivation(reluMask)
+        ut.plotNeuronActivation(reluMask)
         
         # currently dead & alive neurons
-        alive,d=neuronSweeper(reluMask,config)
+        alive,d=ut.neuronSweeper(reluMask,config)
         # dead.append(d.tolist())
         neuronStates[epoch]['dead'] = d.tolist()
         neuronStates[epoch]['alive'] = alive.tolist()
@@ -201,19 +221,42 @@ def runModel(model):
         #     optimizer = optim.AdamW(model.parameters(), lr=config.lr)
         
         #Prune dead neurons
-        if avg_lossV < lastLoss and pruneCheck(dead[-1], dead, prunned):
-        #len(dead) > 1 and not np.array_equal(dead[-1], dead[-2]):
-            # prunned.append(dead[-1])
-            neuronStates[epoch]['prunned'] = d.tolist()
-            print('Prunning!!')
+        if avg_lossV < lastLoss and ut.pruneCheck(neuronStates):
+            #pruneCheck works only after the first epoch has passed
+            
             lastLoss = avg_lossV
-            learnedWeights = model.state_dict()
-            model = GethConsensus(connectivity=alive, weights=learnedWeights).to(config.device)
-            optimizer = optim.AdamW(model.parameters(), lr=config.lr)
+            
+            #check which neurons to prune
+            alive, toPrune = ut.choosePrune(neuronStates, config) #note this alive list is not stored!
+            
+            #Avoid re init model if new toPrune is same as old!
+            if toPrune != neuronStates[epoch-1]['prunned']:
+                
+                print('Prunning!!')
+                
+                learnedWeights = model.state_dict()
+                model = GethConsensus(connectivity=torch.tensor(alive),
+                                      weights=learnedWeights).to(config.device)
+                optimizer = optim.AdamW(model.parameters(), lr=config.lr)
+            else:
+                print('Liveness check showed no new neurons to prune, skipping')
+
+                model.disable_pruning_hooks()
+                
+            neuronStates[epoch]['prunned'] = toPrune
         
         #Halt prunning to stabilize training
         else:
+            #currently prunned neurons didn't change
+            print('Skipping prunning...')
+            if epoch > 0:
+                neuronStates[epoch]['prunned'] = neuronStates[epoch-1]['prunned']
             model.disable_pruning_hooks()
+            
+        print(f'Dead: {neuronStates[-1]["dead"]}')
+        print('Prunned:', end=' ') 
+        for i in range(len(neuronStates)):
+            print(neuronStates[i]['prunned']) 
         
         if config.wb:
             wandb.log({
@@ -224,29 +267,6 @@ def runModel(model):
                 "Validation Recall": recall,
                 "Validation F1": f1
             })
-            
-        print(f'Dead: {dead[-1]}')
-        print('Prunned:', end=' ') 
-        for i in range(len(prunned)):
-            print(prunned[i]) 
-        
-    
-        if avg_loss <= bestTloss and avg_lossV <= bestVloss:
-            bestModel = copy.deepcopy(model)
-            bestTloss = avg_loss
-            bestVloss = avg_lossV
-            # torch.save({
-            #     'model_state_dict': model.state_dict(),
-            #     'optimizer_state_dict': optimizer.state_dict(),
-            #     'epoch': epoch,
-            #     'losstv': (avg_loss, avg_lossV),
-            #     'config': config,
-            # }, config.modelDir / 'best.pth')
-            
-            metrics[0] = (conf_mat,acc,prec,recall,f1)
-            
-            # plot_confusion_matrix(all_labels, all_preds, class_names=[str(i) for i in range(10)])
-    
     
     if config.wb:
         wandb.finish()
@@ -269,4 +289,4 @@ for i in tqdm(range(0,config.runs)):
     model = GethConsensus().to(config.device)
     resA.append(runModel(model))
     
-summarize_results(resA)
+ut.summarize_results(resA)
