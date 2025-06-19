@@ -10,7 +10,7 @@ import torch.nn as nn
 import sparselinear as sl
 
 
-#%%
+##%%
 '''
 import torch
 import sparselinear as sl
@@ -79,93 +79,47 @@ for epoch in range(3):
     optimizer.step()
     print(f"Epoch {epoch+1}, Loss: {loss.item()}")
 #'''
-#%%
+## %%
 
 class GethConsensus(nn.Module):
-    def __init__(self, inSize=784, hidSize=256,
+    def __init__(self, inSize=784, hidSize=64,
                  connectivity=None, weights=None,
-                 hook=True):
+                 hook=False):
         super(GethConsensus, self).__init__()
         
-        # self.fc1 = nn.Linear(784, 256)  
         self.fc2 = nn.Linear(hidSize, 10)  
         
-        if connectivity is not None:
-            
-            #get bool tensor of which neurons are alive
-            alive = torch.zeros(hidSize, dtype=torch.bool)
-            alive[connectivity] = True
-            self.alive = alive
-            
-            # Format the connectivity matrix 
-            rows = connectivity.repeat_interleave(inSize)  # shape: [len(alive_neurons) * input_size]
-            cols = torch.tile(torch.arange(inSize), (len(connectivity),))  # same shape as rows
-            connectivity = torch.stack([rows, cols])
+        self._initialize_weights(weights) #need to be called before the sparse
         
-        if connectivity is None:
-            row = torch.arange(hidSize).repeat_interleave(inSize)
-            col = torch.arange(inSize).repeat(hidSize)
-            connectivity = torch.stack([row, col])
-        
-        self.connectivity=connectivity
-        
-                
-        self.sparse = sl.SparseLinear(in_features=inSize,
-                                      out_features=hidSize,
-                                      connectivity=connectivity,
-                                      sparsity=0.0,
-                                      bias=True)
-        
-        self._initialize_weights(weights)
-        
-        self.relu = nn.ReLU(inplace=True)
-        self.relu_mask = None  # will store mask for active neurons
-        self.hook = hook
-        self._registered_hooks = []  # Track registered hooks
+        self.msparse = ReaperLinear(in_features=inSize,
+                                       out_features=hidSize,
+                                       connectivity=connectivity,
+                                       hook=hook,
+                                       weights=weights,
+                                       whoami='msparse'
+                                       )
     
     def forward(self, x):
         
         x = torch.flatten(x,start_dim=1)
         
-
-        #run the sparse linear even if fully connected
-        x = self.sparse(x) 
-        
-        x = self.relu(x)
-        
-        
-        
-        # Save mask where ReLU was active (non-zero)
-        self.relu_mask = (x != 0).float().detach()
-
-        # Register backward hook to zero out gradients for inactive neurons
-        if self.training and self.hook:
-            handle = x.register_hook(self._hook_zero_inactive)
-            self._registered_hooks.append(handle)
+        x, latent = self.msparse(x)
 
         x = self.fc2(x)
         
-        return x
+        return x, latent
     
-    def _clear_hooks(self):
-        """Remove all registered hooks"""
-        for handle in self._registered_hooks:
-            handle.remove()
-        self._registered_hooks.clear()
-    
-    def enable_pruning_hooks(self):
-        """Enable gradient masking for pruning"""
-        self.hook = True
-    
-    def disable_pruning_hooks(self):
-        """Disable gradient masking to allow recovery"""
-        self.hook = False
-        self._clear_hooks()  # Immediately clear any existing hooks
-    
-    def _hook_zero_inactive(self, grad):
-        # Ensure mask matches the dtype and device of grad
-        mask = self.relu_mask.to(dtype=grad.dtype, device=grad.device)
-        return grad * mask
+    def getReluMasks(self):
+        
+        """Extract ReLU masks from all ReaperLinear layers"""
+        masks = {}
+        
+        for name, module in self.named_modules():
+            if isinstance(module, ReaperLinear):
+                if hasattr(module, 'relu_mask') and module.relu_mask is not None:
+                    masks[name] = module.relu_mask
+        
+        return masks
     
     def _initialize_weights(self, weights):
         if weights is None:
@@ -182,10 +136,104 @@ class GethConsensus(nn.Module):
             return
         
         with torch.no_grad():
+            
+            # 3. Load fc2 weights and biases directly (assuming no pruning in fc2)
+            if 'fc2.weight' in weights:
+                self.fc2.weight.data.copy_(weights['fc2.weight'])
+            
+            if 'fc2.bias' in weights:
+                self.fc2.bias.data.copy_(weights['fc2.bias'])
+    
+    
+
+class ReaperLinear(nn.Module):
+    """
+    A reusable module combining sparse linear layer with ReLU and gradient masking hooks.
+    Handles connectivity, weight initialization, and pruning hooks.
+    """
+    def __init__(self, in_features, out_features, connectivity=None, 
+                 weights=None, hook=True, bias=True, whoami=None):
+        super(ReaperLinear, self).__init__()
+        
+        assert whoami is not None, "Please insert instance name for weight loading"
+        
+        self.in_features = in_features
+        self.out_features = out_features
+        
+        # Handle connectivity
+        if connectivity is not None:
+            # Get bool tensor of which neurons are alive
+            alive = torch.zeros(out_features, dtype=torch.bool)
+            alive[connectivity] = True
+            self.alive = alive
+            
+            # Format the connectivity matrix 
+            rows = connectivity.repeat_interleave(in_features) # shape: [len(alive_neurons) * input_size]
+            cols = torch.tile(torch.arange(in_features), (len(connectivity),)) #same shape as rows
+            connectivity = torch.stack([rows, cols])
+        else:
+            # Fully connected case
+            row = torch.arange(out_features).repeat_interleave(in_features)
+            col = torch.arange(in_features).repeat(out_features)
+            connectivity = torch.stack([row, col])
+            self.alive = None
+        
+        self.connectivity = connectivity
+        
+        # Create sparse linear layer
+        self.sparse = sl.SparseLinear(
+            in_features=in_features,
+            out_features=out_features,
+            connectivity=connectivity,
+            sparsity=0.0,
+            bias=bias
+        )
+        
+        self.relu = nn.ReLU(inplace=True)
+        self.relu_mask = None
+        
+        # Initialize weights
+        self._initialize_weights(weights, whoami)
+    
+    def forward(self, x):
+        # Apply sparse linear transformation
+        x1 = self.sparse(x)
+        
+        # Apply ReLU
+        x = self.relu(x1)
+        
+        # Save mask for gradient masking
+        self.relu_mask = (x != 0).float().detach() #0 = False | 1 = True
+        
+        return x, x1
+    
+    def _initialize_weights(self, weights, whoami):
+        
+        if weights is None:
+            # Simple He/Kaiming initialization for all parameters
+            for name, param in self.named_parameters():
+                if 'weight' in name:
+                    if param.dim() >= 2:  # Only apply kaiming to 2D+ tensors
+                        nn.init.kaiming_normal_(param, mode='fan_in', nonlinearity='relu')
+                    else:  # For 1D tensors (sparse values), use normal with He scaling
+                        std = (2.0 / param.size(0)) ** 0.5
+                        nn.init.normal_(param, mean=0.0, std=std)
+                elif 'bias' in name:
+                    nn.init.constant_(param, 0.01)  # Small positive bias for ReLU
+            return
+        
+        with torch.no_grad():
+            
+            #assert self.sparse.weight is not None, 'weights name error'
+            
+            #select correct layer
+            weightKey = whoami + '.sparse.weights'
+            biasKey =  whoami + '.sparse.bias'
+            idxKey = whoami + '.sparse.indices'
             # 1. Load sparse layer weights
-            if 'sparse.weights' in weights and 'sparse.indices' in weights:
-                old_values = weights['sparse.weights']  # Note: 'weights' not 'weight'
-                old_indices = weights['sparse.indices']
+            if weightKey in weights and idxKey in weights:
+                old_values = weights[weightKey]  
+                old_indices = weights[idxKey]
                 
                 # Get current sparse weight structure
                 current_sparse = self.sparse.weight
@@ -206,32 +254,21 @@ class GethConsensus(nn.Module):
                         new_values[j] = old_weight_map[(out_idx, in_idx)]
                 
                 # Update the sparse tensor values
-                current_sparse._values().copy_(new_values)
+                self.sparse.weight._values().copy_(new_values)
             
             # 2. Load sparse layer biases
-            if 'sparse.bias' in weights and hasattr(self, 'alive'):
-                old_bias = weights['sparse.bias']
-                current_bias = self.sparse.bias
+            if biasKey in weights and hasattr(self, 'alive'):
+                old_bias = weights[biasKey]
                 
                 # Map old bias values to current neurons based on alive mask
                 old_idx = 0
-                for i in range(len(current_bias)):
+                for i in range(len(self.sparse.bias)):
                     if i < len(self.alive) and self.alive[i]:
                         if old_idx < len(old_bias):
-                            current_bias[i] = old_bias[old_idx]
+                            self.sparse.bias.data[i] = old_bias[old_idx]
                             old_idx += 1
                     else:
-                        current_bias[i] = 0.0
-            
-            # 3. Load fc2 weights and biases directly (assuming no pruning in fc2)
-            if 'fc2.weight' in weights:
-                self.fc2.weight.data.copy_(weights['fc2.weight'])
-            
-            if 'fc2.bias' in weights:
-                self.fc2.bias.data.copy_(weights['fc2.bias'])
-    
-    
-    
+                        self.sparse.bias.data[i] = 0.0
     
     
     
